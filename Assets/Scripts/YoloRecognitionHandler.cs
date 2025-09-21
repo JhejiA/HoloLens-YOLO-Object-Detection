@@ -15,11 +15,80 @@ namespace Assets.Scripts
         [SerializeField]
         private GameObject labelObject;
 
+        [Header("Voice Guided Search")]
+        [Tooltip("When enabled the visualizers will only show the detections that match the currently active target class.")]
+        [SerializeField]
+        private bool restrictDetectionsToActiveTarget = true;
+
+        [Tooltip("Highlight color that is applied to the cube when the detected item matches the requested target.")]
+        [SerializeField]
+        private Color targetHighlightColor = new Color(1f, 0.85f, 0.2f, 0.65f);
+
+        [Tooltip("Scale multiplier that is applied to the cube when the detected item matches the requested target.")]
+        [SerializeField]
+        private float targetCubeScaleMultiplier = 1.2f;
+
+        [Header("Cube Visualization")]
+        [Tooltip("Base cube size that will be used for all detections unless a class specific override is configured.")]
+        [SerializeField]
+        private float baseCubeSize = 0.08f;
+
+        [Tooltip("Default cube color that is used when no class specific override is available.")]
+        [SerializeField]
+        private Color defaultCubeColor = new Color(0.16f, 0.74f, 0.88f, 0.45f);
+
+        [SerializeField]
+        private ClassVisualizationSetting[] classVisualization = new ClassVisualizationSetting[0];
+
+        private readonly Dictionary<ObjectClass, ClassVisualizationSetting> classVisualizationLookup = new();
+
         private YoloDebugOutput yoloDebugOutput;
+        private ObjectClass? activeTargetClass;
+        private string activeTargetDisplayName;
+        private bool targetSeenInLastUpdate;
+
+        /// <summary>
+        ///     Event that is raised whenever an item is updated and has reached the minimum visibility threshold.
+        /// </summary>
+        public event Action<DisplayedItem> ItemUpdated;
+
+        /// <summary>
+        ///     Gets the currently active target class that is requested via voice search.
+        /// </summary>
+        public ObjectClass? ActiveTargetClass => this.activeTargetClass;
+
+        /// <summary>
+        ///     Gets the friendly display name of the active target class.
+        /// </summary>
+        public string ActiveTargetDisplayName => this.activeTargetDisplayName;
+
+        /// <summary>
+        ///     Tells whether the currently active target class was visible during the last update.
+        /// </summary>
+        public bool IsActiveTargetVisible => this.targetSeenInLastUpdate;
+
+        /// <summary>
+        ///     Provides read only access to the tracked items.
+        /// </summary>
+        public IReadOnlyList<DisplayedItem> DisplayedItems => this.yoloItems;
+
+        [Serializable]
+        private struct ClassVisualizationSetting
+        {
+            public ObjectClass TargetClass;
+            public Color CubeColor;
+            public float SizeMultiplier;
+        }
 
         private void Start()
         {
+            this.CacheClassVisualization();
             this.yoloDebugOutput = gameObject.GetComponent<YoloDebugOutput>();
+        }
+
+        private void OnValidate()
+        {
+            this.CacheClassVisualization();
         }
 
         /// <summary>
@@ -29,9 +98,46 @@ namespace Assets.Scripts
         /// <param name="cameraTransform">The current camera position.</param>
         public void ShowRecognitions(List<YoloItem> recognitions, CameraTransform cameraTransform)
         {
-            this.AddNewlyRecognizedObjects(recognitions, cameraTransform);
+            List<YoloItem> filteredRecognitions = this.FilterRecognitions(recognitions);
+
+            this.AddNewlyRecognizedObjects(filteredRecognitions, cameraTransform);
             this.RemoveOutdatedObjects();
             this.TriggerDetectionActions();
+        }
+
+        /// <summary>
+        ///     Sets the currently active target class that should be highlighted.
+        /// </summary>
+        /// <param name="targetClass">Target class to search for.</param>
+        /// <param name="displayName">Friendly display name used for logging.</param>
+        public void SetActiveTarget(ObjectClass targetClass, string displayName)
+        {
+            if (this.activeTargetClass.HasValue && this.activeTargetClass.Value == targetClass)
+            {
+                this.activeTargetDisplayName = displayName;
+                return;
+            }
+
+            this.activeTargetClass = targetClass;
+            this.activeTargetDisplayName = displayName;
+            this.targetSeenInLastUpdate = false;
+            this.ClearTrackedItems();
+        }
+
+        /// <summary>
+        ///     Clears the currently active target and shows all detections again.
+        /// </summary>
+        public void ClearActiveTarget()
+        {
+            if (!this.activeTargetClass.HasValue)
+            {
+                return;
+            }
+
+            this.activeTargetClass = null;
+            this.activeTargetDisplayName = null;
+            this.targetSeenInLastUpdate = false;
+            this.ClearTrackedItems();
         }
 
         private void AddNewlyRecognizedObjects(List<YoloItem> recognitions, CameraTransform cameraTransform)
@@ -123,22 +229,46 @@ namespace Assets.Scripts
                     continue;
                 }
 
-                Destroy(yoloItems[i].TrackingMarker);
+                if (yoloItems[i].TrackingMarker != null)
+                {
+                    ObjectLabelController controller = yoloItems[i].TrackingMarker.GetComponent<ObjectLabelController>();
+                    if (controller != null)
+                    {
+                        controller.HideCube();
+                    }
+
+                    Destroy(yoloItems[i].TrackingMarker);
+                }
+
                 this.yoloItems.RemoveAt(i);
             }
         }
 
         private void TriggerDetectionActions()
         {
+            bool targetSeenThisFrame = false;
+
             // Only apply actions if item have been seen multiple times.
-            foreach (DisplayedItem item in this.yoloItems.Where(item => item.IsInCameraView && item.TimesSeen >= Parameters.MinTimesSeen))
+            foreach (DisplayedItem item in this.yoloItems.Where(displayedItem => displayedItem.IsInCameraView && displayedItem.TimesSeen >= Parameters.MinTimesSeen))
             {
+                if (this.activeTargetClass.HasValue && item.YoloItem.MostLikelyClass == this.activeTargetClass.Value)
+                {
+                    targetSeenThisFrame = true;
+                }
+
                 // Show marker
                 this.ManageTrackingMarker(item);
 
                 // Show debug information
-                yoloDebugOutput.ShowDebugInformationForItem(item);
+                if (this.yoloDebugOutput != null)
+                {
+                    this.yoloDebugOutput.ShowDebugInformationForItem(item);
+                }
+
+                this.ItemUpdated?.Invoke(item);
             }
+
+            this.targetSeenInLastUpdate = this.activeTargetClass.HasValue && targetSeenThisFrame;
         }
 
         /// <summary>
@@ -155,7 +285,90 @@ namespace Assets.Scripts
             ObjectLabelController labelController = item.TrackingMarker.GetComponent<ObjectLabelController>();
             labelController.Text = $"{item.YoloItem.MostLikelyClass} ({Math.Round(item.YoloItem.Confidence * 100, 3)}%)";
             labelController.UpdatePosition(item.PositionInSpace);
-   
+
+            Color cubeColor = this.ResolveCubeColor(item.YoloItem.MostLikelyClass);
+            float cubeSize = this.ResolveCubeSize(item.YoloItem.MostLikelyClass);
+
+            if (this.activeTargetClass.HasValue && item.YoloItem.MostLikelyClass == this.activeTargetClass.Value)
+            {
+                cubeColor = this.targetHighlightColor;
+                cubeSize *= this.targetCubeScaleMultiplier;
+            }
+
+            labelController.UpdateCubeAppearance(cubeColor, cubeSize);
+        }
+
+        private List<YoloItem> FilterRecognitions(List<YoloItem> recognitions)
+        {
+            if (!this.restrictDetectionsToActiveTarget || !this.activeTargetClass.HasValue)
+            {
+                return recognitions;
+            }
+
+            return recognitions.Where(item => item.MostLikelyClass == this.activeTargetClass.Value).ToList();
+        }
+
+        private void ClearTrackedItems()
+        {
+            foreach (DisplayedItem item in this.yoloItems)
+            {
+                if (item.TrackingMarker != null)
+                {
+                    Destroy(item.TrackingMarker);
+                }
+            }
+
+            this.yoloItems.Clear();
+        }
+
+        private void CacheClassVisualization()
+        {
+            this.classVisualizationLookup.Clear();
+
+            if (this.classVisualization == null)
+            {
+                return;
+            }
+
+            foreach (ClassVisualizationSetting setting in this.classVisualization)
+            {
+                ClassVisualizationSetting sanitized = this.SanitizeSetting(setting);
+                this.classVisualizationLookup[sanitized.TargetClass] = sanitized;
+            }
+        }
+
+        private ClassVisualizationSetting SanitizeSetting(ClassVisualizationSetting setting)
+        {
+            ClassVisualizationSetting sanitized = setting;
+            if (sanitized.SizeMultiplier <= 0f)
+            {
+                sanitized.SizeMultiplier = 1f;
+            }
+
+            return sanitized;
+        }
+
+        private Color ResolveCubeColor(ObjectClass objectClass)
+        {
+            ClassVisualizationSetting setting;
+            if (this.classVisualizationLookup.TryGetValue(objectClass, out setting) && setting.CubeColor.a > 0.001f)
+            {
+                return setting.CubeColor;
+            }
+
+            return this.defaultCubeColor;
+        }
+
+        private float ResolveCubeSize(ObjectClass objectClass)
+        {
+            ClassVisualizationSetting setting;
+            if (this.classVisualizationLookup.TryGetValue(objectClass, out setting))
+            {
+                return this.baseCubeSize * setting.SizeMultiplier;
+            }
+
+            return this.baseCubeSize;
         }
     }
 }
+
